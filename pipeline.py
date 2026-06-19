@@ -27,11 +27,11 @@ BASE_DIR = Path(__file__).resolve().parent
 BACKGROUNDS_DIR = BASE_DIR / "backgrounds"
 OUTPUT_DIR = BASE_DIR / "output"
 TEMP_DIR = BASE_DIR / "temp"
-DESKTOP_COPY_DIR = Path("/Users/claytonvanfleet/Desktop/Horror Stories")
+DESKTOP_COPY_DIR = Path.home() / "OneDrive" / "Desktop" / "Horror Stories"
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 
-DEFAULT_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"  # George
+DEFAULT_VOICE_ID = "Uh6UEmMIUnnL0GOOUghh"
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
 log = logging.getLogger("horror-pipeline")
@@ -40,9 +40,10 @@ log = logging.getLogger("horror-pipeline")
 # ── Validation ───────────────────────────────────────────────────────────────
 
 def validate_environment(dry_run: bool = False) -> list[str]:
-    """Check that all required tools and credentials are available.
+    """Check that all required tools, credentials, and directories are ready.
 
     Returns a list of error messages. Empty list means everything is OK.
+    Performs all checks before any API calls are made.
     """
     errors: list[str] = []
 
@@ -53,11 +54,16 @@ def validate_environment(dry_run: bool = False) -> list[str]:
         if not os.environ.get("ELEVENLABS_API_KEY"):
             errors.append("ELEVENLABS_API_KEY not set. Add it to .env file.")
 
-        if not shutil.which("ffmpeg"):
-            errors.append("ffmpeg not found. Install it with: brew install ffmpeg")
-
-        if not shutil.which("ffprobe"):
-            errors.append("ffprobe not found. Install it with: brew install ffmpeg")
+        # Verify ffmpeg/ffprobe exist and actually run
+        for tool in ("ffmpeg", "ffprobe"):
+            if not shutil.which(tool):
+                errors.append(f"{tool} not found. Install it with: winget install Gyan.FFmpeg")
+            else:
+                result = subprocess.run(
+                    [tool, "-version"], capture_output=True
+                )
+                if result.returncode != 0:
+                    errors.append(f"{tool} found but failed to run. Try reinstalling via winget.")
 
         if not BACKGROUNDS_DIR.exists():
             errors.append(
@@ -68,6 +74,13 @@ def validate_environment(dry_run: bool = False) -> list[str]:
             errors.append(
                 "No .mp4 files found in backgrounds/. Add background video clips to use."
             )
+
+        # Create output directories and verify they're writable before any API calls
+        for directory in (OUTPUT_DIR, TEMP_DIR, DESKTOP_COPY_DIR):
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                errors.append(f"Cannot create directory {directory}: {e}")
 
     return errors
 
@@ -218,43 +231,52 @@ def sanitize_filename(title: str) -> str:
 
 def run_pipeline(args: argparse.Namespace) -> None:
     """Run the full pipeline for --count videos."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    TEMP_DIR.mkdir(exist_ok=True)
-
-    # Select setting hints for this batch
-    if args.count <= len(SETTING_HINTS):
-        hints = random.sample(SETTING_HINTS, args.count)
+    if args.script:
+        iterations = [(1, None)]
+        total = 1
     else:
-        # Cycle through hints if count exceeds list size
-        hints = []
-        while len(hints) < args.count:
-            hints.extend(random.sample(SETTING_HINTS, len(SETTING_HINTS)))
-        hints = hints[: args.count]
+        if args.count <= len(SETTING_HINTS):
+            hints = random.sample(SETTING_HINTS, args.count)
+        else:
+            hints = []
+            while len(hints) < args.count:
+                hints.extend(random.sample(SETTING_HINTS, len(SETTING_HINTS)))
+            hints = hints[: args.count]
+        iterations = list(enumerate(hints, 1))
+        total = args.count
 
     succeeded = 0
     failed = 0
 
-    for i, hint in enumerate(hints, 1):
-        log.info("── Video %d/%d ──", i, args.count)
+    for i, hint in iterations:
+        log.info("── Video %d/%d ──", i, total)
         try:
-            # Stage 1: Generate script
-            log.info("Generating script (setting: %s)...", hint)
-            script, title = generate_script(hint)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base_name = f"{sanitize_filename(title)}_{timestamp}"
+            if args.script:
+                # Skip Stage 1 — use the provided script file directly
+                script = args.script.read_text(encoding="utf-8")
+                base_name = args.script.stem
+                title = base_name.replace("-", " ").title()
+                log.info("Using script file: %s", args.script.name)
 
-            # Create per-video output directory
-            video_dir = OUTPUT_DIR / base_name
-            video_dir.mkdir(exist_ok=True)
+                video_dir = OUTPUT_DIR / base_name
+                video_dir.mkdir(exist_ok=True)
+            else:
+                # Stage 1: Generate script
+                log.info("Generating script (setting: %s)...", hint)
+                script, title = generate_script(hint)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                base_name = f"{sanitize_filename(title)}_{timestamp}"
 
-            # Save script text
-            script_path = video_dir / f"{base_name}.txt"
-            script_path.write_text(script, encoding="utf-8")
-            log.info("Script saved: %s", script_path.name)
+                video_dir = OUTPUT_DIR / base_name
+                video_dir.mkdir(exist_ok=True)
+
+                script_path = video_dir / f"{base_name}.txt"
+                script_path.write_text(script, encoding="utf-8")
+                log.info("Script saved: %s", script_path.name)
 
             if args.dry_run:
                 print(f"\n{'='*60}")
-                print(f"[{i}/{args.count}] {title}")
+                print(f"[{i}/{total}] {title}")
                 print(f"{'='*60}")
                 print(script)
                 print()
@@ -272,7 +294,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
             assemble_video(audio_path, video_path)
 
             # Copy final video to Desktop
-            DESKTOP_COPY_DIR.mkdir(parents=True, exist_ok=True)
             desktop_dest = DESKTOP_COPY_DIR / f"{base_name}.mp4"
             shutil.copy2(video_path, desktop_dest)
             log.info("Copied to %s", desktop_dest)
@@ -282,7 +303,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
         except Exception:
             failed += 1
-            log.exception("Failed to generate video %d/%d", i, args.count)
+            log.exception("Failed to generate video %d/%d", i, total)
 
     # Cleanup temp files
     if not args.keep_temp and TEMP_DIR.exists():
@@ -291,7 +312,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     # Summary
     print(f"\n{'='*60}")
-    print(f"Batch complete: {succeeded} succeeded, {failed} failed out of {args.count}")
+    print(f"Batch complete: {succeeded} succeeded, {failed} failed out of {total}")
     print(f"Output directory: {OUTPUT_DIR}")
     print(f"{'='*60}")
 
@@ -318,7 +339,13 @@ def main() -> None:
     parser.add_argument(
         "--voice",
         default=DEFAULT_VOICE_ID,
-        help=f"ElevenLabs voice ID (default: George / {DEFAULT_VOICE_ID})",
+        help=f"ElevenLabs voice ID (default: {DEFAULT_VOICE_ID})",
+    )
+    parser.add_argument(
+        "--script",
+        type=Path,
+        metavar="FILE",
+        help="Path to an existing .txt script file. Skips AI generation and goes straight to TTS and video.",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging"
@@ -336,7 +363,12 @@ def main() -> None:
     # Load env
     load_dotenv(BASE_DIR / ".env")
 
-    # Validate
+    # Validate script file exists before anything else
+    if args.script and not args.script.exists():
+        print(f"ERROR: Script file not found: {args.script}")
+        sys.exit(1)
+
+    # Validate environment
     errors = validate_environment(dry_run=args.dry_run)
     if errors:
         for err in errors:
