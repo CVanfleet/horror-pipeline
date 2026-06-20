@@ -20,19 +20,41 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from prompts import SETTING_HINTS, SYSTEM_PROMPT, USER_PROMPT
+from prompts_history import HISTORY_SYSTEM_PROMPT, HISTORY_TOPIC_HINTS, HISTORY_USER_PROMPT
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
 BASE_DIR = Path(__file__).resolve().parent
-BACKGROUNDS_DIR = BASE_DIR / "backgrounds"
+BACKGROUNDS_DIR = BASE_DIR / "backgrounds"  # parent; subfolders used per channel
 OUTPUT_DIR = BASE_DIR / "output"
 TEMP_DIR = BASE_DIR / "temp"
-DESKTOP_COPY_DIR = Path.home() / "OneDrive" / "Desktop" / "Horror Stories"
+DESKTOP = Path.home() / "OneDrive" / "Desktop"
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 
 DEFAULT_VOICE_ID = "Uh6UEmMIUnnL0GOOUghh"
 DEFAULT_MODEL = "claude-sonnet-4-6"
+
+CHANNELS = {
+    "horror": {
+        "system_prompt": SYSTEM_PROMPT,
+        "user_prompt": USER_PROMPT,
+        "hints": SETTING_HINTS,
+        "label": "Horror Story",
+        "output_dir": OUTPUT_DIR / "horror",
+        "desktop_dir": DESKTOP / "Horror Stories",
+        "backgrounds_dir": BACKGROUNDS_DIR / "horror",
+    },
+    "history": {
+        "system_prompt": HISTORY_SYSTEM_PROMPT,
+        "user_prompt": HISTORY_USER_PROMPT,
+        "hints": HISTORY_TOPIC_HINTS,
+        "label": "Dark History",
+        "output_dir": OUTPUT_DIR / "history",
+        "desktop_dir": DESKTOP / "Dark History",
+        "backgrounds_dir": BACKGROUNDS_DIR / "history",
+    },
+}
 
 log = logging.getLogger("horror-pipeline")
 
@@ -65,18 +87,22 @@ def validate_environment(dry_run: bool = False) -> list[str]:
                 if result.returncode != 0:
                     errors.append(f"{tool} found but failed to run. Try reinstalling via winget.")
 
-        if not BACKGROUNDS_DIR.exists():
-            errors.append(
-                f"backgrounds/ directory not found at {BACKGROUNDS_DIR}. "
-                "Create it and add .mp4 background clips."
-            )
-        elif not list(BACKGROUNDS_DIR.glob("*.mp4")):
-            errors.append(
-                "No .mp4 files found in backgrounds/. Add background video clips to use."
-            )
+        for ch_name, ch in CHANNELS.items():
+            bg_dir = ch["backgrounds_dir"]
+            if not bg_dir.exists():
+                errors.append(
+                    f"backgrounds/{ch_name}/ not found. Create it and add .mp4 clips."
+                )
+            elif not list(bg_dir.glob("*.mp4")):
+                errors.append(
+                    f"No .mp4 files found in backgrounds/{ch_name}/. Add background clips."
+                )
 
         # Create output directories and verify they're writable before any API calls
-        for directory in (OUTPUT_DIR, TEMP_DIR, DESKTOP_COPY_DIR):
+        dirs = [TEMP_DIR] + [
+            d for ch in CHANNELS.values() for d in (ch["output_dir"], ch["desktop_dir"])
+        ]
+        for directory in dirs:
             try:
                 directory.mkdir(parents=True, exist_ok=True)
             except OSError as e:
@@ -87,8 +113,10 @@ def validate_environment(dry_run: bool = False) -> list[str]:
 
 # ── Stage 1: Script Generation ───────────────────────────────────────────────
 
-def generate_script(setting_hint: str) -> tuple[str, str]:
-    """Generate a horror narration script using Claude.
+def generate_script(
+    hint: str, system_prompt: str, user_prompt: str
+) -> tuple[str, str]:
+    """Generate a narration script using Claude.
 
     Returns (script_text, title).
     """
@@ -98,34 +126,27 @@ def generate_script(setting_hint: str) -> tuple[str, str]:
     message = client.messages.create(
         model=DEFAULT_MODEL,
         max_tokens=1024,
-        system=SYSTEM_PROMPT,
+        system=system_prompt,
         messages=[
-            {"role": "user", "content": USER_PROMPT.format(setting_hint=setting_hint)}
+            {"role": "user", "content": user_prompt.format(hint=hint)}
         ],
     )
 
     full_response = message.content[0].text
 
-    # Parse title from response
     title_match = re.search(r"TITLE:\s*(.+)", full_response)
     if title_match:
         title = title_match.group(1).strip()
-        # Remove the TITLE: line from the script
         script = full_response[: title_match.start()].strip()
     else:
         log.warning("No TITLE: line found in response. Using timestamp as title.")
         title = f"untitled_{datetime.now().strftime('%H%M%S')}"
         script = full_response.strip()
 
-    # Word count check
     word_count = len(script.split())
-    if not 150 <= word_count <= 300:
-        log.warning(
-            "Script word count (%d) outside target range 200-250. Continuing anyway.",
-            word_count,
-        )
-    else:
-        log.info("Script word count: %d", word_count)
+    log.info("Script word count: %d", word_count)
+    if not 150 <= word_count <= 400:
+        log.warning("Script word count (%d) is outside expected bounds.", word_count)
 
     return script, title
 
@@ -181,13 +202,13 @@ def get_audio_duration(audio_path: Path) -> float:
     return float(data["format"]["duration"])
 
 
-def assemble_video(audio_path: Path, output_path: Path) -> Path:
+def assemble_video(audio_path: Path, output_path: Path, backgrounds_dir: Path) -> Path:
     """Combine audio narration with a random background video.
 
     Returns the path to the final MP4.
     """
     duration = get_audio_duration(audio_path)
-    background = random.choice(list(BACKGROUNDS_DIR.glob("*.mp4")))
+    background = random.choice(list(backgrounds_dir.glob("*.mp4")))
     log.info("Using background: %s (audio duration: %.1fs)", background.name, duration)
 
     cmd = [
@@ -229,45 +250,55 @@ def sanitize_filename(title: str) -> str:
     return name[:60]  # cap length
 
 
-def run_pipeline(args: argparse.Namespace) -> None:
-    """Run the full pipeline for --count videos."""
-    if args.script:
-        iterations = [(1, None)]
-        total = 1
-    else:
-        if args.count <= len(SETTING_HINTS):
-            hints = random.sample(SETTING_HINTS, args.count)
-        else:
-            hints = []
-            while len(hints) < args.count:
-                hints.extend(random.sample(SETTING_HINTS, len(SETTING_HINTS)))
-            hints = hints[: args.count]
-        iterations = list(enumerate(hints, 1))
-        total = args.count
+def _sample_hints(hints: list, count: int) -> list:
+    """Return `count` items sampled without replacement, cycling if needed."""
+    if count <= len(hints):
+        return random.sample(hints, count)
+    result = []
+    while len(result) < count:
+        result.extend(random.sample(hints, len(hints)))
+    return result[:count]
 
+
+def run_pipeline(args: argparse.Namespace) -> None:
+    """Run the full pipeline for --count videos per active channel."""
+    # Build work list: [(channel_name, hint), ...]
+    if args.script:
+        work = [("horror", None)]
+    else:
+        active = (
+            list(CHANNELS.keys()) if args.mode == "both" else [args.mode]
+        )
+        work = []
+        for channel_name in active:
+            hints = _sample_hints(CHANNELS[channel_name]["hints"], args.count)
+            work.extend((channel_name, h) for h in hints)
+
+    total = len(work)
     succeeded = 0
     failed = 0
 
-    for i, hint in iterations:
-        log.info("── Video %d/%d ──", i, total)
+    for i, (channel_name, hint) in enumerate(work, 1):
+        channel = CHANNELS[channel_name]
+        log.info("── Video %d/%d [%s] ──", i, total, channel["label"])
         try:
             if args.script:
-                # Skip Stage 1 — use the provided script file directly
                 script = args.script.read_text(encoding="utf-8")
                 base_name = args.script.stem
                 title = base_name.replace("-", " ").title()
                 log.info("Using script file: %s", args.script.name)
 
-                video_dir = OUTPUT_DIR / base_name
+                video_dir = channel["output_dir"] / base_name
                 video_dir.mkdir(exist_ok=True)
             else:
-                # Stage 1: Generate script
-                log.info("Generating script (setting: %s)...", hint)
-                script, title = generate_script(hint)
+                log.info("Generating script (hint: %s)...", hint)
+                script, title = generate_script(
+                    hint, channel["system_prompt"], channel["user_prompt"]
+                )
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 base_name = f"{sanitize_filename(title)}_{timestamp}"
 
-                video_dir = OUTPUT_DIR / base_name
+                video_dir = channel["output_dir"] / base_name
                 video_dir.mkdir(exist_ok=True)
 
                 script_path = video_dir / f"{base_name}.txt"
@@ -276,7 +307,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
             if args.dry_run:
                 print(f"\n{'='*60}")
-                print(f"[{i}/{total}] {title}")
+                print(f"[{i}/{total}] [{channel['label']}] {title}")
                 print(f"{'='*60}")
                 print(script)
                 print()
@@ -291,10 +322,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
             # Stage 3: Assemble video
             log.info("Assembling video...")
             video_path = video_dir / f"{base_name}.mp4"
-            assemble_video(audio_path, video_path)
+            assemble_video(audio_path, video_path, channel["backgrounds_dir"])
 
             # Copy final video to Desktop
-            desktop_dest = DESKTOP_COPY_DIR / f"{base_name}.mp4"
+            desktop_dest = channel["desktop_dir"] / f"{base_name}.mp4"
             shutil.copy2(video_path, desktop_dest)
             log.info("Copied to %s", desktop_dest)
 
@@ -310,10 +341,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
         shutil.rmtree(TEMP_DIR)
         log.info("Cleaned up temp/")
 
-    # Summary
     print(f"\n{'='*60}")
     print(f"Batch complete: {succeeded} succeeded, {failed} failed out of {total}")
-    print(f"Output directory: {OUTPUT_DIR}")
+    print(f"Output directory: {OUTPUT_DIR}/")
     print(f"{'='*60}")
 
 
@@ -335,6 +365,12 @@ def main() -> None:
         "--keep-temp",
         action="store_true",
         help="Preserve intermediate MP3 files in temp/",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["horror", "history", "both"],
+        default="both",
+        help="Content mode: horror stories, dark history facts, or both (default: horror)",
     )
     parser.add_argument(
         "--voice",

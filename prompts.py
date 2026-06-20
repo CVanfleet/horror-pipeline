@@ -39,7 +39,7 @@ Just watching..."
 USER_PROMPT = """Write a new horror narration script.
 
 Requirements:
-- Unique setting: {setting_hint}
+- Unique setting: {hint}
 - Word count: 275-325 words
 - Must feel like a "based on true events" retelling
 - Haunting encounters with other people are encouraged
