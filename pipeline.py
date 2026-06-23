@@ -28,7 +28,7 @@ BASE_DIR = Path(__file__).resolve().parent
 BACKGROUNDS_DIR = BASE_DIR / "backgrounds"  # parent; subfolders used per channel
 OUTPUT_DIR = BASE_DIR / "output"
 TEMP_DIR = BASE_DIR / "temp"
-DESKTOP = Path.home() / "OneDrive" / "Desktop"
+DESKTOP = Path.home() / "Desktop"
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 
