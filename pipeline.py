@@ -29,6 +29,8 @@ BACKGROUNDS_DIR = BASE_DIR / "backgrounds"  # parent; subfolders used per channe
 OUTPUT_DIR = BASE_DIR / "output"
 TEMP_DIR = BASE_DIR / "temp"
 DESKTOP = Path.home() / "Desktop"
+STORY_HISTORY_FILE = BASE_DIR / "story_history.json"
+MAX_HISTORY = 40  # total entries kept across all channels
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 
@@ -57,6 +59,32 @@ CHANNELS = {
 }
 
 log = logging.getLogger("horror-pipeline")
+
+
+# ── Story history ─────────────────────────────────────────────────────────────
+
+def load_story_history() -> list[dict]:
+    """Return past story records from disk, or [] if none exist yet."""
+    if not STORY_HISTORY_FILE.exists():
+        return []
+    try:
+        return json.loads(STORY_HISTORY_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        log.warning("Could not read story_history.json — starting fresh.")
+        return []
+
+
+def save_to_history(
+    history: list[dict], title: str, hint: str, channel: str
+) -> list[dict]:
+    """Append one entry and persist the trimmed list; returns the updated list."""
+    updated = (history + [{"title": title, "hint": hint, "channel": channel,
+                           "date": datetime.now().strftime("%Y-%m-%d")}])[-MAX_HISTORY:]
+    try:
+        STORY_HISTORY_FILE.write_text(json.dumps(updated, indent=2), encoding="utf-8")
+    except Exception:
+        log.warning("Could not save story_history.json.")
+    return updated
 
 
 # ── Validation ───────────────────────────────────────────────────────────────
@@ -114,7 +142,11 @@ def validate_environment(dry_run: bool = False) -> list[str]:
 # ── Stage 1: Script Generation ───────────────────────────────────────────────
 
 def generate_script(
-    hint: str, system_prompt: str, user_prompt: str
+    hint: str,
+    system_prompt: str,
+    user_prompt: str,
+    channel: str = "",
+    history: list[dict] | None = None,
 ) -> tuple[str, str]:
     """Generate a narration script using Claude.
 
@@ -122,13 +154,26 @@ def generate_script(
     """
     import anthropic
 
+    content = user_prompt.format(hint=hint)
+
+    # Inject recent stories for this channel so Claude avoids repeating them
+    if history:
+        past = [h for h in history if h.get("channel") == channel][-20:]
+        if past:
+            lines = "\n".join(f'- "{h["title"]}" (setting: {h["hint"]})' for h in past)
+            content += (
+                "\n\nThe following stories have already been produced for this channel. "
+                "Do NOT repeat their settings, themes, core plot structures, or reveal types. "
+                "Each new story must feel distinct from all of these:\n" + lines
+            )
+
     client = anthropic.Anthropic()
     message = client.messages.create(
         model=DEFAULT_MODEL,
         max_tokens=1024,
         system=system_prompt,
         messages=[
-            {"role": "user", "content": user_prompt.format(hint=hint)}
+            {"role": "user", "content": content}
         ],
     )
 
@@ -277,6 +322,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
     total = len(work)
     succeeded = 0
     failed = 0
+    history = load_story_history()
+    log.info("Loaded %d past story entries from history.", len(history))
 
     for i, (channel_name, hint) in enumerate(work, 1):
         channel = CHANNELS[channel_name]
@@ -293,7 +340,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
             else:
                 log.info("Generating script (hint: %s)...", hint)
                 script, title = generate_script(
-                    hint, channel["system_prompt"], channel["user_prompt"]
+                    hint, channel["system_prompt"], channel["user_prompt"],
+                    channel=channel_name, history=history,
                 )
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 base_name = f"{sanitize_filename(title)}_{timestamp}"
@@ -311,6 +359,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 print(f"{'='*60}")
                 print(script)
                 print()
+                history = save_to_history(history, title, hint, channel_name)
                 succeeded += 1
                 continue
 
@@ -329,6 +378,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             shutil.copy2(video_path, desktop_dest)
             log.info("Copied to %s", desktop_dest)
 
+            history = save_to_history(history, title, hint, channel_name)
             succeeded += 1
             log.info("Done: %s", video_path.name)
 
