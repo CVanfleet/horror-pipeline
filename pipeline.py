@@ -295,18 +295,37 @@ def sanitize_filename(title: str) -> str:
     return name[:60]  # cap length
 
 
-def _sample_hints(hints: list, count: int) -> list:
-    """Return `count` items sampled without replacement, cycling if needed."""
-    if count <= len(hints):
-        return random.sample(hints, count)
-    result = []
+def _sample_hints(hints: list, count: int, recent: set[str] | None = None) -> list:
+    """Return `count` hints, preferring ones not in `recent`.
+
+    Falls back to recently-used hints only when the fresh pool is too small.
+    """
+    excluded = recent or set()
+    fresh = [h for h in hints if h not in excluded]
+    used  = [h for h in hints if h in  excluded]
+
+    result: list[str] = []
+
+    # Drain fresh pool first
+    if fresh:
+        result += random.sample(fresh, min(count, len(fresh)))
+
+    # Top up from used pool if still short
+    if len(result) < count and used:
+        result += random.sample(used, min(count - len(result), len(used)))
+
+    # If count exceeds the entire hints list, cycle through all hints to fill the rest
     while len(result) < count:
-        result.extend(random.sample(hints, len(hints)))
+        result += random.sample(hints, min(count - len(result), len(hints)))
+
     return result[:count]
 
 
 def run_pipeline(args: argparse.Namespace) -> None:
     """Run the full pipeline for --count videos per active channel."""
+    history = load_story_history()
+    log.info("Loaded %d past story entries from history.", len(history))
+
     # Build work list: [(channel_name, hint), ...]
     if args.script:
         work = [("horror", None)]
@@ -316,14 +335,13 @@ def run_pipeline(args: argparse.Namespace) -> None:
         )
         work = []
         for channel_name in active:
-            hints = _sample_hints(CHANNELS[channel_name]["hints"], args.count)
+            recent_hints = {h["hint"] for h in history if h.get("channel") == channel_name}
+            hints = _sample_hints(CHANNELS[channel_name]["hints"], args.count, recent=recent_hints)
             work.extend((channel_name, h) for h in hints)
 
     total = len(work)
     succeeded = 0
     failed = 0
-    history = load_story_history()
-    log.info("Loaded %d past story entries from history.", len(history))
 
     for i, (channel_name, hint) in enumerate(work, 1):
         channel = CHANNELS[channel_name]
